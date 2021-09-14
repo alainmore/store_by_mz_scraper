@@ -48,9 +48,7 @@ gmaps = googlemaps.Client(key=api_key)
 
 # Store parameters to scrape, currently hardcoded por 1 store.
 # Need to change in the execute method to probably use a loop reading from a table or CSV file
-code_list = ["CO"]
-brand_to_scrape_id = 32917
-brand_to_scrape = "Koaj"
+code_list = [("CO",32917,"Koaj")]
 
 
 def execute_snowflake_query(query, with_cursor=False):
@@ -150,55 +148,52 @@ def execute_process():
     conn.cursor().execute("USE SCHEMA FIVETRAN.GLOBAL_ECOMMERCE")
     conn.cursor().execute("USE ROLE GLOBAL_ECOMMERCE_WRITE_ROLE")
     conn.cursor().execute("USE WAREHOUSE ECOMMERCE")
+    # Get all existing stores in Rappi
+    df_all_rappi_stores = pandas_df_from_snowflake_query(
+        """   
+        SELECT
+            COUNTRY AS CODE
+            ,STORE_ID AS RP_STORE_ID
+            ,IS_ENABLED AS RP_IS_ENABLED
+            ,LAT
+            ,LNG
+            ,BRAND_ID AS RP_BRAND_ID
+            ,MICROZONE_ID AS RP_MICROZONE_ID
+        FROM
+        GLOBAL_ECOMMERCE.ECOMMERCE_STORES
+        """
+    )
+    log.info(">>ALL RAPPI stores: ")
+    log.info(df_all_rappi_stores.shape[0])
+    log.info(df_all_rappi_stores.head())
 
+    # Get all active microzones info for the current country
+    df_all_microzones = pandas_df_from_snowflake_query(
+        """   
+        SELECT * 
+        FROM GLOBAL_VALUE_PROP_DS.active_microzones
+        WHERE 
+            IS_ACTIVE
+            """
+    )
+    log.info(">>ALL MICROZONES: ")
+    log.info(df_all_microzones.shape[0])
+    log.info(df_all_microzones.head())
     # As explained before, this loop needs to be adapted to whatever
     # input method might be used to scrape (CSV, table or other)
-    for code in code_list:
-        log.info(">>>>>>>>>>>> Code: " + code)
-        # Get all existing stores in Rappi
-        df_rappi_stores = pandas_df_from_snowflake_query(
-            """   
-            SELECT
-                COUNTRY AS CODE
-                ,STORE_ID AS RP_STORE_ID
-                ,IS_ENABLED AS RP_IS_ENABLED
-                ,LAT
-                ,LNG
-                ,BRAND_ID AS RP_BRAND_ID
-                ,MICROZONE_ID AS RP_MICROZONE_ID
-            FROM
-            GLOBAL_ECOMMERCE.ECOMMERCE_STORES
-            WHERE
-                COUNTRY = '"""
-            + code
-            + """'
-                AND RP_BRAND_ID = """
-            + str(brand_to_scrape_id)
-            + """
-            """
-        )
-        log.info(">>RAPPI stores: " + code + ", " + str(brand_to_scrape_id))
-        log.info(df_rappi_stores.shape[0])
-        log.info(df_rappi_stores.head())
-
-        # Get all active microzones info for the current country
-        df_microzones = pandas_df_from_snowflake_query(
-            """   
-            SELECT * 
-            FROM GLOBAL_VALUE_PROP_DS.active_microzones
-            WHERE 
-                CODE = '"""
-            + code
-            + """'
-                AND IS_ACTIVE 
-                AND MICROZONE_ID < 234
-                """
-        )
-        log.info(df_microzones.shape[0])
-        log.info(df_microzones.head())
-
+    for row in code_list:
         # For each microzone from he previous step, scrape all stores for the current brand,
         # in an approximate 5km radius from the mz centroid
+        code = row[0]
+        brand_to_scrape_id = row[1]
+        brand_to_scrape = row[2]
+        log.info(">>>>>>>>>>>> Code: " + code)
+        log.info(">>>>>>>>>>>> Brand ID: " + str(brand_to_scrape_id))
+        log.info(">>>>>>>>>>>> Brand Name: " + brand_to_scrape)
+
+        df_rappi_stores = df_all_rappi_stores.loc[(df_all_rappi_stores['CODE']==code) & (df_all_rappi_stores['RP_BRAND_ID']==brand_to_scrape_id)]
+        df_microzones = df_all_microzones.loc[df_all_microzones['CODE'] == code]
+
         stores_to_insert = []
         for index, row in df_microzones.iterrows():
             mz_id = row["MICROZONE_ID"]
@@ -247,7 +242,8 @@ def execute_process():
                 store_lng = row["lng"]
                 store_types = row["types"]
                 store_status = row["business_status"]
-                store_address, store_phone = get_store_details(place_id)
+                store_address = ""
+                store_phone = ""
 
                 log.info(
                     "STORE "
@@ -273,6 +269,7 @@ def execute_process():
                 # We validate the scraped result has the store name in its NAME field,
                 # if not we ignore it
                 if brand_to_scrape.upper() in store_name.upper():
+                    current_time = pd.to_datetime('today').strftime('%Y-%m-%d %H:%M:%S')
                     stores_to_insert.append(
                         [
                             code,
@@ -287,7 +284,7 @@ def execute_process():
                             store_phone,
                             store_lat,
                             store_lng,
-                            datetime.now(),
+                            current_time
                         ]
                     )
             print(
@@ -325,6 +322,14 @@ def execute_process():
             ">>Tiendas unicas para el brand en Rappi: "
             + str(len(df_rappi_stores.index))
         )
+        log.info("")
+        # Scrape and get store details from Google
+        for index, row in df_scraper.iterrows():
+            store_pid = row["G_PLACE_ID"]
+            log.info(">> Google details for " + str(store_pid))
+            store_address, store_phone = get_store_details(store_pid)
+            df_scraper.loc[index, "G_ADDRESS"] = store_address
+            df_scraper.loc[index, "G_PHONE"] = store_phone
 
         # We join, for each of our scraped stores, all existing rappi stores for the brand
         # Then, for each combination, we get its distance and validate if it might be in Rappi or not
@@ -348,6 +353,7 @@ def execute_process():
         df_stores_to_insert = df_joined.loc[
             df_joined.groupby("G_PLACE_ID").DISTANCE.idxmin()
         ].reset_index(drop=True)
+        # We reorder columns to match order in table of snowflake
         df_stores_to_insert = df_stores_to_insert[
             [
                 "CODE",
@@ -372,6 +378,7 @@ def execute_process():
         print(">> df_stores_to_insert")
         print(df_stores_to_insert.head())
         print(list(df_stores_to_insert.columns.values))
+        # CSV to review inserted stores, feel free to remove this line if nor needed
         df_stores_to_insert.to_csv('store_inserted.csv',encoding='utf-8')
 
         # We insert the results in snowflake, in the country's correct table
